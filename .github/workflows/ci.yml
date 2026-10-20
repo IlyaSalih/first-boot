@@ -1,0 +1,174 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:        # кнопка "Run workflow" во вкладке Actions
+
+# Новый push в ту же ветку отменяет предыдущий незавершённый прогон
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Статическая проверка: синтаксис, shellcheck, определение дистрибутива
+  # ---------------------------------------------------------------------------
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n (синтаксис)
+        run: bash -n first-boot.sh
+
+      - name: shellcheck
+        run: shellcheck -S warning first-boot.sh
+
+      - name: Определение дистрибутива
+        run: |
+          # Загружаем только функции скрипта (всё до блока ЗАПУСК), без выполнения
+          LIB=$(sed '/^#  ЗАПУСК/,$d' first-boot.sh)
+          fail=0
+          check() {   # check <ожидаемое семейство> <содержимое os-release>
+            printf '%b\n' "$2" > /tmp/os-release
+            got=$( (eval "$LIB"; OS_RELEASE_FILE=/tmp/os-release; detect_os >/dev/null 2>&1 && echo "$OS_FAMILY") ) || got=unsupported
+            if [ "$got" = "$1" ]; then echo "ok    $(head -1 /tmp/os-release) -> $got"
+            else echo "FAIL  $(head -1 /tmp/os-release): ждали $1, получили $got"; fail=1; fi
+          }
+          check debian      'ID=debian\nVERSION_ID="12"'
+          check debian      'ID=ubuntu\nID_LIKE=debian\nVERSION_ID="24.04"'
+          check debian      'ID=astra\nVERSION_ID="1.7_x86-64"'
+          check rhel        'ID="rhel"\nID_LIKE="fedora"\nVERSION_ID="9.4"'
+          check rhel        'ID="rocky"\nID_LIKE="rhel centos fedora"\nVERSION_ID="9.4"'
+          check rhel        'ID="almalinux"\nID_LIKE="rhel centos fedora"\nVERSION_ID="8.10"'
+          check rhel        'ID="ol"\nID_LIKE="fedora"\nVERSION_ID="9.4"'
+          check rhel        'ID="centos"\nID_LIKE="rhel fedora"\nVERSION_ID="9"'
+          check rhel        'ID=fedora\nVERSION_ID=41'
+          check rhel        'ID="amzn"\nID_LIKE="fedora"\nVERSION_ID="2023"'
+          check rhel        'ID="redos"\nVERSION_ID="8.0"'
+          check rhel        'ID="eurolinux"\nID_LIKE="rhel fedora centos"\nVERSION_ID="9"'
+          check suse        'ID="sles"\nID_LIKE="suse"\nVERSION_ID="15.6"'
+          check suse        'ID="opensuse-leap"\nID_LIKE="suse opensuse"\nVERSION_ID="15.6"'
+          check suse        'ID="opensuse-tumbleweed"\nID_LIKE="opensuse suse"'
+          check unsupported 'ID=arch'
+          check unsupported 'ID=altlinux\nVERSION_ID=10'
+          exit $fail
+
+  # ---------------------------------------------------------------------------
+  # 2. Полный прогон на настоящей ВМ (с systemd) + реальные попытки входа
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: e2e (${{ matrix.os }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Запуск first-boot.sh
+        run: |
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/k"
+          sudo env NEEDRESTART_SUSPEND=1 \
+            SSH_PORT=2222 SUDO_NOPASSWD=true SKIP_UPGRADE=true EXTRA_TCP_PORTS="80 443" \
+            SSH_PUBKEY="$(cat "$RUNNER_TEMP/k.pub")" \
+            bash first-boot.sh
+
+      - name: Проверка SSH
+        run: |
+          K="$RUNNER_TEMP/k"
+          O="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes"
+
+          echo "--- noroot по ключу + sudo: должен пустить"
+          ssh $O -p 2222 -i "$K" noroot@127.0.0.1 'sudo -n true' && echo OK
+
+          echo "--- сервер предлагает только publickey (пароль отключён)"
+          methods=$(ssh $O -v -p 2222 -o PubkeyAuthentication=no noroot@127.0.0.1 true 2>&1 \
+                    | tr -d '\r' | grep -m1 'Authentications that can continue' || true)
+          echo "$methods"
+          echo "$methods" | grep -q 'continue: publickey$'
+
+          echo "--- root по ключу: должен отказать"
+          sudo install -d -m 700 /root/.ssh
+          sudo tee -a /root/.ssh/authorized_keys < "$K.pub" >/dev/null
+          ! ssh $O -p 2222 -i "$K" root@127.0.0.1 true
+
+          echo "--- устаревший шифр: должен отказать"
+          ! ssh $O -p 2222 -i "$K" -o Ciphers=aes128-cbc noroot@127.0.0.1 true
+
+          echo "--- старый порт 22 закрыт"
+          ! ssh $O -p 22 -i "$K" noroot@127.0.0.1 true
+
+      - name: Проверка firewall, fail2ban, sysctl
+        run: |
+          sudo ufw status verbose
+          sudo ufw status | grep -qE '^2222/tcp +LIMIT'
+          sudo ufw status | grep -qE '^443/tcp +ALLOW'
+          sudo fail2ban-client status sshd
+          test "$(sysctl -n net.ipv4.tcp_syncookies)" = 1
+          test "$(sysctl -n kernel.kptr_restrict)" = 2
+          sudo sshd -T | grep -E '^(port|permitrootlogin|passwordauthentication|allowusers) '
+
+      - name: Повторный запуск (идемпотентность)
+        run: |
+          sudo env NEEDRESTART_SUSPEND=1 \
+            SSH_PORT=2222 SUDO_NOPASSWD=true SKIP_UPGRADE=true EXTRA_TCP_PORTS="80 443" \
+            SSH_PUBKEY="$(cat "$RUNNER_TEMP/k.pub")" \
+            bash first-boot.sh
+          # ключ не задублировался
+          test "$(sudo grep -c . /home/noroot/.ssh/authorized_keys)" = 1
+
+  # ---------------------------------------------------------------------------
+  # 3. Пакетный этап на каждом дистрибутиве (в контейнерах, без systemd)
+  # ---------------------------------------------------------------------------
+  packages:
+    name: packages (${{ matrix.image }})
+    needs: lint
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # f2b: должен ли установиться fail2ban
+        # experimental: падение не красит весь прогон в красный
+        include:
+          - { image: "debian:12",                           f2b: "yes", experimental: false }
+          - { image: "debian:13",                           f2b: "yes", experimental: false }
+          - { image: "ubuntu:22.04",                        f2b: "yes", experimental: false }
+          - { image: "ubuntu:24.04",                        f2b: "yes", experimental: false }
+          - { image: "rockylinux/rockylinux:9",             f2b: "yes", experimental: false }
+          - { image: "almalinux:8",                         f2b: "yes", experimental: false }
+          - { image: "almalinux:9",                         f2b: "yes", experimental: false }
+          - { image: "almalinux:10",                        f2b: "yes", experimental: false }
+          - { image: "oraclelinux:9",                       f2b: "yes", experimental: false }
+          - { image: "quay.io/centos/centos:stream9",       f2b: "yes", experimental: false }
+          - { image: "fedora:latest",                       f2b: "yes", experimental: false }
+          - { image: "opensuse/leap:15.6",                  f2b: "yes", experimental: false }
+          - { image: "opensuse/tumbleweed",                 f2b: "yes", experimental: true  }
+          - { image: "amazonlinux:2023",                    f2b: "no",  experimental: false }
+          - { image: "registry.access.redhat.com/ubi9/ubi", f2b: "no",  experimental: true  }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Пакетный этап
+        run: |
+          docker run --rm \
+            -v "$PWD:/src:ro" -w /src \
+            -e HARDEN_TEST_STAGE=packages \
+            -e EXPECT_F2B="${{ matrix.f2b }}" \
+            "${{ matrix.image }}" \
+            bash -c '
+              set -e
+              bash first-boot.sh
+              echo "--- проверка установленного"
+              { command -v sshd || test -x /usr/sbin/sshd; } >/dev/null && echo "sshd: ok"
+              command -v sudo >/dev/null && echo "sudo: ok"
+              if [ "$EXPECT_F2B" = yes ]; then
+                command -v fail2ban-client >/dev/null && echo "fail2ban: ok"
+              fi
+            '

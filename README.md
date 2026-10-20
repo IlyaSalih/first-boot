@@ -1,0 +1,147 @@
+# first-boot
+
+[![ci](https://github.com/IlyaSalih/first-boot/actions/workflows/ci.yml/badge.svg)](https://github.com/IlyaSalih/first-boot/actions/workflows/ci.yml)
+
+Скрипт первичной защиты нового Linux-сервера. Запускается один раз сразу после создания машины. Сам определяет дистрибутив и настраивает его родными средствами. После запуска на сервер можно войти только по SSH-ключу и только под отдельным пользователем `noroot`.
+
+## Быстрый старт
+
+Зайди на свежий сервер под пользователем, которого создало облако. Его SSH-ключ скрипт подхватит сам.
+
+```bash
+git clone https://github.com/IlyaSalih/first-boot.git
+cd first-boot
+sudo SSH_PORT=2222 bash first-boot.sh
+```
+
+Без git (в минимальных образах его часто нет):
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/IlyaSalih/first-boot/main/first-boot.sh
+less first-boot.sh          # всегда читай скрипт перед запуском от root
+sudo SSH_PORT=2222 bash first-boot.sh
+```
+
+> ⚠️ **Не закрывай текущую SSH-сессию**, пока в новом окне не проверишь вход:
+> ```bash
+> ssh -p 2222 noroot@<IP>
+> sudo -v
+> ```
+
+## Поддерживаемые дистрибутивы
+
+| Семейство | Дистрибутивы | Firewall | Автообновления |
+|---|---|---|---|
+| **debian** | Debian 11–13, Ubuntu 20.04+, Astra Linux SE¹ | ufw | unattended-upgrades |
+| **rhel** | RHEL 8–10, Rocky, AlmaLinux, Oracle Linux, CentOS Stream, Fedora, Amazon Linux 2023², RED OS¹ | firewalld | dnf-automatic (security) |
+| **suse** | SLES 15³, openSUSE Leap 15, openSUSE Tumbleweed⁴ | firewalld | `zypper patch --category security` по таймеру |
+
+¹ Определяются автоматически, но на реальных ВМ не тестировались. На Astra автообновления по умолчанию выключены: в сертифицированных средах обновления ставят по бюллетеням.
+² На Amazon Linux нет пакетов firewalld и fail2ban. Сетевую защиту там дают Security Groups.
+³ На SLES fail2ban лежит в PackageHub, скрипт подскажет команду для подключения.
+⁴ Tumbleweed — rolling-релиз, автообновление (`zypper dup`) не включается.
+
+**Не поддерживаются:** Alt Linux, Arch, Alpine, immutable-системы (Fedora CoreOS, SLE Micro), контейнеры без systemd.
+
+## Что делает скрипт
+
+| Шаг | Что настраивается |
+|---|---|
+| 1. Обновления | Полное обновление системы; на RHEL-клонах подключение EPEL (ради fail2ban) |
+| 2. Пакеты | firewall, fail2ban, автообновления, NTP, часовой пояс |
+| 3. SELinux | Нестандартный порт SSH помечается как `ssh_port_t`, иначе sshd не запустится |
+| 4. Пользователь | Создаётся `noroot` с SSH-ключом и sudo. Root блокируется только после проверки, что sudo работает |
+| 5. Firewall | Входящие запрещены по умолчанию; открыт SSH и дополнительные порты |
+| 6. Fail2Ban | Бан за перебор SSH, время бана растёт с каждым повтором (до 1 недели) |
+| 7. Обновления и ядро | Security-патчи по расписанию; sysctl: защита от SYN-flood, спуфинга, ICMP redirect |
+| 8. SSH | Только ключи, root запрещён, `AllowUsers noroot`, современная криптография |
+
+### Вход по паролю
+
+По SSH вход по паролю **полностью отключён** (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `AuthenticationMethods publickey`). Пароль пользователя `noroot` нужен только для `sudo` внутри сервера и для входа через серийную консоль облака.
+
+### Защита от потери доступа
+
+SSH настраивается последним. Перед перезапуском скрипт проверяет:
+
+- каждый SSH-ключ на валидность (`ssh-keygen -l`), так что опечатка в ключе не заблокирует вход;
+- синтаксис конфига (`sshd -t`);
+- итоговые настройки (`sshd -T`): если другой файл в `sshd_config.d`, например от cloud-init, перебивает `PasswordAuthentication` или `Port`, скрипт остановится;
+- SELinux: если он в режиме Enforcing, а метку порта поставить не удалось, скрипт остановится до смены порта.
+
+При любой ошибке SSH **не перезапускается**, текущий доступ сохраняется.
+
+## Переменные
+
+Все настройки передаются через переменные окружения.
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `NEW_USER` | `noroot` | Пользователь для входа по SSH |
+| `SSH_PUBKEY` | — | Публичный ключ (можно несколько, по одному на строку). Если не задан, берётся из `authorized_keys` того, кто запустил `sudo`, затем root |
+| `SSH_PORT` | `22` | Порт SSH |
+| `EXTRA_TCP_PORTS` | — | Доп. TCP-порты через пробел: `"80 443"`, диапазон: `"30000:32767"` |
+| `EXTRA_UDP_PORTS` | — | Доп. UDP-порты: `"51820"` |
+| `SUDO_NOPASSWD` | `false` | `true` — sudo без пароля (нужно для Ansible) |
+| `TIMEZONE` | `Europe/Moscow` | Часовой пояс |
+| `FIREWALL` | `true` | `false` — не трогать firewall на хосте (если всё закрыто облачным) |
+| `AUTO_UPDATES` | `true`¹ | Автоустановка security-обновлений |
+| `AUTO_REBOOT` | `false` | Перезагрузка, если обновление её требует |
+| `AUTO_REBOOT_TIME` | `04:00` | Время такой перезагрузки |
+| `SKIP_UPGRADE` | `false` | `true` — не делать полное обновление системы при запуске |
+
+¹ На Astra Linux по умолчанию `false`.
+
+### Примеры
+
+```bash
+# Веб-сервер
+sudo SSH_PORT=2222 EXTRA_TCP_PORTS="80 443" bash first-boot.sh
+
+# VPN-сервер (WireGuard)
+sudo SSH_PORT=2222 EXTRA_UDP_PORTS="51820" bash first-boot.sh
+
+# Нода под Ansible
+sudo SUDO_NOPASSWD=true bash first-boot.sh
+
+# Worker-нода Kubernetes (kubelet + NodePort)
+sudo EXTRA_TCP_PORTS="10250 30000:32767" bash first-boot.sh
+
+# Свой ключ вместо ключа облачного пользователя
+sudo SSH_PUBKEY="$(cat ~/id_ed25519.pub)" bash first-boot.sh
+```
+
+## Важно
+
+- **Облачный firewall.** Если меняешь порт SSH, открой его в security group (Yandex Cloud, AWS и т.п.) **до** запуска скрипта.
+- **`AllowUsers`.** После скрипта по SSH сможет войти только `noroot`. Пользователь, созданный облаком (`yc-user`, `ec2-user`, `cloud-user`), доступ потеряет. Его ключ скрипт переносит пользователю `noroot` автоматически.
+- **Серийная консоль.** Если сломается сеть, в консоль облака можно войти под `noroot` с паролем, заданным при запуске. При `SUDO_NOPASSWD=true` пароля нет, и консоль недоступна.
+- **RHEL и crypto-policies.** На RHEL-семействе алгоритмы SSH не переопределяются: их задаёт системная политика. Для более строгого режима: `update-crypto-policies --set FUTURE`.
+- **Идемпотентность.** Повторный запуск не ломает систему и не дублирует ключи и правила.
+- **`ip_forward` не трогается**, чтобы не ломать Docker, Kubernetes и VPN.
+
+## Проверка после запуска
+
+```bash
+sudo sshd -T | grep -Ei '^(port|passwordauthentication|permitrootlogin|allowusers) '
+sudo ufw status verbose            # Debian/Ubuntu
+sudo firewall-cmd --list-all       # RHEL/SUSE
+sudo fail2ban-client status sshd   # забаненные IP
+```
+
+Все файлы, которые создаёт скрипт, помечены комментарием `managed by first-boot`:
+
+```bash
+sudo grep -rl 'managed by first-boot' /etc /usr/local/sbin
+```
+
+## CI
+
+На каждый push GitHub Actions запускает три проверки:
+
+1. **lint**: `shellcheck` и проверка определения дистрибутива на наборе `os-release`.
+2. **e2e**: полный запуск скрипта на Ubuntu-ВМ, затем реальные попытки входа. По ключу должно пускать; пароль, root и устаревший шифр должны отклоняться.
+3. **packages**: пакетный этап (`HARDEN_TEST_STAGE=packages`) в контейнерах 15 дистрибутивов. Проверяется определение ОС, подключение репозиториев (EPEL и т.п.) и наличие нужных пакетов.
+
+Перед использованием на продакшене прогони скрипт на тестовой ВМ с тем же образом.
+
