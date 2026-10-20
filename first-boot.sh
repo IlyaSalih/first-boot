@@ -18,7 +18,8 @@
 set -Eeuo pipefail
 
 ### ===================== НАСТРОЙКИ (задаются через env) ======================
-NEW_USER="${NEW_USER:-noroot}"             # пользователь для входа по SSH
+NEW_USER="${NEW_USER:-}"                   # пользователь для входа по SSH; не задан —
+DEFAULT_USER="noroot"                      # спросим при запуске (по умолчанию noroot)
 SSH_PUBKEY="${SSH_PUBKEY:-}"               # публичный ключ(и), по одному на строку
 SSH_PORT="${SSH_PORT:-22}"                 # порт SSH
 EXTRA_TCP_PORTS="${EXTRA_TCP_PORTS:-}"     # доп. TCP-порты: "80 443"
@@ -30,6 +31,8 @@ AUTO_UPDATES="${AUTO_UPDATES:-default}"    # true / false; default = true (кр�
 AUTO_REBOOT="${AUTO_REBOOT:-false}"        # перезагрузка, если обновление её требует
 AUTO_REBOOT_TIME="${AUTO_REBOOT_TIME:-04:00}"
 SKIP_UPGRADE="${SKIP_UPGRADE:-false}"      # true = не делать полное обновление системы
+SAFE_PORT_SWITCH="${SAFE_PORT_SWITCH:-auto}" # держать старый порт SSH открытым, пока не подтвердишь
+                                           # вход по новому: auto (если есть терминал) / true / false
 ### ===========================================================================
 
 # shellcheck disable=SC2034  # переменные семейных модулей используются в общих функциях
@@ -83,8 +86,6 @@ preflight() {
   if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
     die "Некорректный SSH_PORT: $SSH_PORT"
   fi
-  [[ "$NEW_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "Некорректное имя пользователя: $NEW_USER"
-  [[ "$NEW_USER" != "root" ]] || die "NEW_USER не может быть root"
   [[ "$AUTO_REBOOT_TIME" =~ ^[0-2][0-9]:[0-5][0-9]$ ]] || die "AUTO_REBOOT_TIME должен быть в формате ЧЧ:ММ"
   local p
   for p in $EXTRA_TCP_PORTS $EXTRA_UDP_PORTS; do
@@ -191,6 +192,50 @@ setup_selinux_ssh_port() {
 }
 
 # ------------------------------------------------------------------ пользователь
+# Проверка имени. Печатает причину отказа; код 0 — имя подходит
+user_name_problem() {
+  local u=$1 uid
+  if ! [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+    echo "допустимы строчные латинские буквы, цифры, '-' и '_', начинать с буквы или '_', до 32 символов"
+    return 1
+  fi
+  if [[ "$u" == "root" ]]; then echo "root нельзя — смысл скрипта в том, чтобы под root не входить"; return 1; fi
+  if getent group "$u" >/dev/null && ! id "$u" &>/dev/null; then
+    echo "есть группа с таким именем, но нет такого пользователя — выбери другое имя"; return 1
+  fi
+  if id "$u" &>/dev/null; then
+    uid=$(id -u "$u")
+    if (( uid < 1000 )); then echo "это системная учётная запись (UID $uid)"; return 1; fi
+  fi
+  return 0
+}
+
+choose_user() {
+  local why ans
+  if [[ -n "$NEW_USER" ]]; then
+    why=$(user_name_problem "$NEW_USER") || die "Некорректное имя пользователя '$NEW_USER': $why"
+  elif [[ -t 0 ]]; then
+    while true; do
+      read -r -p "Имя пользователя для входа по SSH [${DEFAULT_USER}]: " NEW_USER || NEW_USER=""
+      NEW_USER="${NEW_USER:-$DEFAULT_USER}"
+      if why=$(user_name_problem "$NEW_USER"); then break; fi
+      warn "Имя '$NEW_USER' не подходит: $why"
+    done
+  else
+    NEW_USER="$DEFAULT_USER"
+  fi
+
+  # Уже существующий обычный пользователь (например, ubuntu) — переспросим
+  # (не спрашиваем при повторном запуске — если пользователя создал сам скрипт)
+  if id "$NEW_USER" &>/dev/null && [[ -t 0 ]] \
+     && [[ ! -f "/etc/sudoers.d/90-${HARDEN_TAG}-${NEW_USER}" ]]; then
+    warn "Пользователь '$NEW_USER' уже существует: ему добавятся sudo и SSH-ключ, а остальные пользователи потеряют вход по SSH"
+    read -r -p "Продолжить с '$NEW_USER'? [y/n]: " ans || ans=n
+    [[ "$ans" =~ ^(y|Y|д|Д|yes|да)$ ]] || die "Остановлено. Запусти заново и выбери другое имя"
+  fi
+  log "Пользователь для входа: $NEW_USER"
+}
+
 setup_user() {
   if ! id "$NEW_USER" &>/dev/null; then
     log "Создаю пользователя $NEW_USER"
@@ -264,6 +309,9 @@ ufw_setup() {
   ufw default deny incoming  >/dev/null
   ufw default allow outgoing >/dev/null
   ufw limit "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
+  if [[ "$PORT_TRANSITION" == "true" ]]; then
+    ufw limit "${OLD_SSH_PORT}/tcp" comment 'SSH old port (temporary, first-boot)' >/dev/null
+  fi
   local p
   for p in $EXTRA_TCP_PORTS; do ufw allow "${p}/tcp" >/dev/null; done
   for p in $EXTRA_UDP_PORTS; do ufw allow "${p}/udp" >/dev/null; done
@@ -280,7 +328,9 @@ firewalld_setup() {
     fw=(firewall-offline-cmd)   # правила до запуска — чтобы не отрезать SSH
   fi
   "${fw[@]}" --add-port="${SSH_PORT}/tcp" >/dev/null
-  if [[ "$SSH_PORT" != "22" ]]; then
+  if [[ "$PORT_TRANSITION" == "true" ]]; then
+    "${fw[@]}" --add-port="${OLD_SSH_PORT}/tcp" >/dev/null   # временно, до подтверждения входа
+  elif [[ "$SSH_PORT" != "22" ]]; then
     "${fw[@]}" --remove-service=ssh >/dev/null 2>&1 || true
   fi
   "${fw[@]}" --remove-service=cockpit >/dev/null 2>&1 || true   # веб-консоль RHEL, порт 9090
@@ -462,6 +512,9 @@ verify_sshd_effective() {
   done
   local extra
   extra=$(grep -i '^port ' <<< "$eff" | grep -vix "port $SSH_PORT" || true)
+  if [[ "$PORT_TRANSITION" == "true" ]]; then
+    extra=$(grep -vix "port $OLD_SSH_PORT" <<< "$extra" || true)
+  fi
   if [[ -n "$extra" ]]; then warn "sshd будет слушать ещё и: $(echo "$extra" | tr '\n' ' ')— где-то в конфиге есть другой Port"; fi
   return "$bad"
 }
@@ -502,15 +555,24 @@ EOF
     fi
   } > "$conf"
   chmod 600 "$conf"
-  if have restorecon; then restorecon "$conf" 2>/dev/null || true; fi
+
+  # Старый порт временно остаётся открытым (Port можно указать несколько раз)
+  if [[ "$PORT_TRANSITION" == "true" ]]; then
+    printf '# managed by %s: старый порт, временно — до подтверждения входа по новому\n# Закрыть: sudo first-boot-close-old-port\nPort %s\n' \
+      "$HARDEN_TAG" "$OLD_SSH_PORT" > "$TRANSITION_CONF"
+    chmod 600 "$TRANSITION_CONF"
+  else
+    rm -f "$TRANSITION_CONF"
+  fi
+  if have restorecon; then restorecon /etc/ssh/sshd_config.d/* 2>/dev/null || true; fi
 
   mkdir -p /run/sshd
   if ! sshd -t; then
-    rm -f "$conf"
+    rm -f "$conf" "$TRANSITION_CONF"
     die "Конфиг sshd невалиден — SSH НЕ перезапущен, текущий доступ сохранён"
   fi
   if ! verify_sshd_effective; then
-    rm -f "$conf"
+    rm -f "$conf" "$TRANSITION_CONF"
     die "Итоговые настройки sshd не совпадают с ожидаемыми — SSH НЕ перезапущен. Проверь другие файлы в /etc/ssh/sshd_config.d/ и порядок Include"
   fi
 
@@ -535,23 +597,159 @@ EOF
   fi
 }
 
+# ------------------------------------------------------------------ смена порта
+TRANSITION_CONF=/etc/ssh/sshd_config.d/01-first-boot-old-port.conf
+CLOSE_HELPER=/usr/local/sbin/first-boot-close-old-port
+OLD_SSH_PORT=22
+PORT_TRANSITION=false
+
+# Какой порт sshd слушает сейчас и нужно ли держать его открытым при смене
+plan_port_switch() {
+  local cur
+  # Повторный запуск, когда старый порт ещё не закрыт — продолжаем ту же смену
+  if [[ -f "$TRANSITION_CONF" ]]; then
+    cur=$(awk '$1=="Port"{print $2; exit}' "$TRANSITION_CONF")
+    if [[ -n "$cur" && "$cur" != "$SSH_PORT" ]]; then
+      OLD_SSH_PORT="$cur"
+      PORT_TRANSITION=true
+      warn "Запасной порт ${OLD_SSH_PORT} с прошлого запуска ещё открыт — оставляю до подтверждения"
+      return 0
+    fi
+  fi
+  cur=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}') || true
+  OLD_SSH_PORT="${cur:-22}"
+  if [[ "$OLD_SSH_PORT" == "$SSH_PORT" ]]; then
+    PORT_TRANSITION=false
+    return 0
+  fi
+  case "$SAFE_PORT_SWITCH" in
+    true)  PORT_TRANSITION=true ;;
+    false) PORT_TRANSITION=false ;;
+    *)     if [[ -t 0 ]]; then PORT_TRANSITION=true; else PORT_TRANSITION=false; fi ;;
+  esac
+
+  printf '\n\e[1;33m'
+  cat <<EOF
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  SSH переезжает с порта ${OLD_SSH_PORT} на ${SSH_PORT}.
+  │  Открой входящий TCP ${SSH_PORT} в security group облака (если она есть)
+  │  — сейчас, пока скрипт работает. Firewall внутри ВМ скрипт настроит сам.
+EOF
+  if [[ "$PORT_TRANSITION" == "true" ]]; then
+    echo "  │  Порт ${OLD_SSH_PORT} останется открытым как запасной, пока ты не"
+    echo "  │  подтвердишь вход по новому порту."
+  fi
+  echo "  └────────────────────────────────────────────────────────────────────┘"
+  printf '\e[0m\n'
+}
+
+# Скрипт, закрывающий старый порт (запускается сразу или позже вручную)
+write_close_helper() {
+  {
+    echo '#!/bin/sh'
+    echo "# managed by ${HARDEN_TAG}: закрыть временный старый порт SSH ${OLD_SSH_PORT}"
+    echo 'set -e'
+    echo "rm -f ${TRANSITION_CONF}"
+    echo 'sshd -t'
+    echo "systemctl restart ${SSH_SERVICE}"
+    case "$FIREWALL_KIND" in
+      ufw)       echo "ufw delete limit ${OLD_SSH_PORT}/tcp >/dev/null 2>&1 || true" ;;
+      firewalld) echo "firewall-cmd --permanent --remove-port=${OLD_SSH_PORT}/tcp >/dev/null 2>&1 || true"
+                 if [[ "$OLD_SSH_PORT" == "22" ]]; then
+                   echo "firewall-cmd --permanent --remove-service=ssh >/dev/null 2>&1 || true"
+                 fi
+                 echo 'firewall-cmd --reload >/dev/null' ;;
+    esac
+    echo "echo 'Порт ${OLD_SSH_PORT} закрыт. SSH работает только на порту ${SSH_PORT}.'"
+    echo 'rm -f "$0"'
+  } > "$CLOSE_HELPER"
+  chmod 700 "$CLOSE_HELPER"
+}
+
+# Ждём, пока пользователь проверит вход по новому порту
+confirm_port_switch() {
+  [[ "$PORT_TRANSITION" == "true" ]] || return 0
+  write_close_helper
+  local ip ans
+  ip="${PUBLIC_IP:-<ПУБЛИЧНЫЙ_IP>}"
+  if [[ ! -t 0 ]]; then
+    warn "Порт ${OLD_SSH_PORT} оставлен открытым. Когда проверишь вход по ${SSH_PORT}: sudo first-boot-close-old-port"
+    return 0
+  fi
+  printf '\n\e[1;36m'
+  cat <<EOF
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  ПРОВЕРЬ ВХОД ПО НОВОМУ ПОРТУ (в новом окне терминала):
+  │
+  │     ssh -p ${SSH_PORT} ${NEW_USER}@${ip}
+  │
+  │  Подвисло без ответа — порт ${SSH_PORT} закрыт в security group облака.
+  │  Сразу «Permission denied» — проблема с ключом.
+  │  Пока не подтвердишь, запасной вход открыт: ssh -p ${OLD_SSH_PORT} ${NEW_USER}@${ip}
+  └────────────────────────────────────────────────────────────────────┘
+EOF
+  printf '\e[0m'
+  while true; do
+    read -r -p "  Вход по порту ${SSH_PORT} работает? Закрыть порт ${OLD_SSH_PORT}? [y/n]: " ans || ans=n
+    case "$ans" in
+      y|Y|д|Д|yes|да)
+        "$CLOSE_HELPER"
+        return 0 ;;
+      n|N|н|Н|no|нет)
+        warn "Порт ${OLD_SSH_PORT} оставлен открытым. Закрыть позже: sudo first-boot-close-old-port"
+        return 0 ;;
+    esac
+  done
+}
+
 # ------------------------------------------------------------------ итог
+# Публичный IP: метаданные облака (Yandex Cloud / GCP / AWS), затем внешний сервис
+detect_public_ip() {
+  local ip="" token="" re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+  have curl || return 0
+  ip=$(curl -fsS -m 2 -H 'Metadata-Flavor: Google' \
+    http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip 2>/dev/null) || ip=""
+  if ! [[ "$ip" =~ $re ]]; then
+    token=$(curl -fsS -m 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+      http://169.254.169.254/latest/api/token 2>/dev/null) || token=""
+    ip=$(curl -fsS -m 2 ${token:+-H "X-aws-ec2-metadata-token: $token"} \
+      http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null) || ip=""
+  fi
+  if ! [[ "$ip" =~ $re ]]; then
+    ip=$(curl -fsS -m 3 https://api.ipify.org 2>/dev/null) || ip=""
+  fi
+  if [[ "$ip" =~ $re ]]; then PUBLIC_IP="$ip"; fi
+}
+
 summary() {
-  local ip
-  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  local priv
+  priv=$(hostname -I 2>/dev/null | awk '{print $1}')
   echo
   log "Готово. Слушающие порты:"
-  ss -tulpnH 2>/dev/null | awk '{print "    " $1 "  " $5}' | sort -u || true
+  if have ss; then ss -tulpnH 2>/dev/null | awk '{print "    " $1 "  " $5}' | sort -u || true; fi
+
+  local reboot_msg=""
+  if [[ -f /var/run/reboot-required ]] || { [[ -n "${REBOOT_CHECK:-}" ]] && sh -c "$REBOOT_CHECK"; }; then
+    reboot_msg="  Обновилось ядро или системные библиотеки — после проверки входа: sudo reboot"
+  fi
+  local old_msg=""
+  if [[ -f "$TRANSITION_CONF" ]]; then
+    old_msg="  Запасной порт ${OLD_SSH_PORT} ещё открыт. Закрыть: sudo first-boot-close-old-port"
+  fi
+
   cat <<EOF
 
 =====================================================================
-  НЕ ЗАКРЫВАЙ ЭТУ СЕССИЮ. В новом терминале проверь вход:
+  Вход на сервер:
 
-     ssh -p ${SSH_PORT} ${NEW_USER}@${ip:-<IP>}
-     sudo -v
+     ssh -p ${SSH_PORT} ${NEW_USER}@${PUBLIC_IP:-<ПУБЛИЧНЫЙ_IP>}
 
-  Если не пускает — исправь через эту сессию.
-  Не забудь открыть порт ${SSH_PORT} в security group облака.
+  Публичный IP:  ${PUBLIC_IP:-не определён — смотри в консоли облака}
+  Внутренний IP: ${priv:-?} (доступен только изнутри облачной сети)
+
+  Не пускает и висит — порт ${SSH_PORT} закрыт в security group облака.
+${old_msg}
+${reboot_msg}
 =====================================================================
 EOF
 }
@@ -566,7 +764,7 @@ SUDO_GROUP=sudo
 SSH_SERVICE=ssh
 MANAGE_CRYPTO=true
 NATIVE_REBOOT=true          # unattended-upgrades перезагружает сам
-REBOOT_CHECK=""
+REBOOT_CHECK='[ -f /var/run/reboot-required ]'
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a   # needrestart: перезапускать сервисы без вопросов
@@ -864,6 +1062,7 @@ fi
 
 preflight
 detect_os
+choose_user
 resolve_pubkey
 
 log "Система: $OS_NAME (семейство: $OS_FAMILY)"
@@ -884,6 +1083,8 @@ step "2/8 Пакеты"
 os_install_packages
 report_tools
 setup_time
+detect_public_ip
+plan_port_switch
 
 step "3/8 SELinux"
 setup_selinux_ssh_port
@@ -903,5 +1104,6 @@ setup_sysctl
 
 step "8/8 SSH"
 setup_ssh
+confirm_port_switch
 
 summary

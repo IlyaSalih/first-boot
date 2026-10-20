@@ -123,6 +123,28 @@ jobs:
           # ключ не задублировался
           test "$(sudo grep -c . /home/noroot/.ssh/authorized_keys)" = 1
 
+      - name: Безопасная смена порта (запасной порт до подтверждения)
+        run: |
+          K="$RUNNER_TEMP/k"
+          O="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes"
+          # Переезд 2222 -> 2200; без терминала + SAFE_PORT_SWITCH=true старый порт остаётся открытым
+          sudo env NEEDRESTART_SUSPEND=1 \
+            SSH_PORT=2200 SAFE_PORT_SWITCH=true SUDO_NOPASSWD=true SKIP_UPGRADE=true \
+            SSH_PUBKEY="$(cat "$K.pub")" \
+            bash first-boot.sh
+
+          echo "--- работают оба порта"
+          ssh $O -p 2200 -i "$K" noroot@127.0.0.1 true
+          ssh $O -p 2222 -i "$K" noroot@127.0.0.1 true
+          sudo ufw status | grep -qE '^2222/tcp +LIMIT'
+
+          echo "--- закрываем старый порт"
+          sudo first-boot-close-old-port
+          ssh $O -p 2200 -i "$K" noroot@127.0.0.1 true
+          ! ssh $O -p 2222 -i "$K" noroot@127.0.0.1 true
+          ! sudo ufw status | grep -qE '^2222/tcp '
+          test ! -e /usr/local/sbin/first-boot-close-old-port
+
   # ---------------------------------------------------------------------------
   # 3. Пакетный этап на каждом дистрибутиве (в контейнерах, без systemd)
   # ---------------------------------------------------------------------------
